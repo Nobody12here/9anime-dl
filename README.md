@@ -7,6 +7,8 @@ It supports:
 - sub and dub streams
 - automatic server fallback
 - single episode and batch range downloads
+- optional parallel HLS segment downloading (`--parallel-segments`)
+- direct authorized m3u8 downloads (`--m3u8-url`)
 
 ## Quick Start
 
@@ -50,6 +52,18 @@ python main.py "https://9animetv.to/watch/vinland-saga-40?ep=1144"
 python main.py "<URL>" [--type sub|dub] [--range START-END] [--out OUTPUT_DIR]
 ```
 
+Parallel segment mode:
+
+```bash
+python main.py "<URL>" --parallel-segments [--workers 8]
+```
+
+Direct authorized m3u8 mode:
+
+```bash
+python main.py --m3u8-url "<M3U8_URL>" --name "my-video" --out downloads --parallel-segments --workers 12
+```
+
 ### Arguments
 
 | Argument | Description | Default |
@@ -58,6 +72,10 @@ python main.py "<URL>" [--type sub|dub] [--range START-END] [--out OUTPUT_DIR]
 | `--type` | Stream type: `sub` or `dub` | `sub` |
 | `--range` | Episode range for batch mode, example: `1-12` | None |
 | `--out` | Output directory for downloaded files | `downloads` |
+| `--parallel-segments` | Download HLS segments concurrently and remux | Off |
+| `--workers` | Number of concurrent segment workers in parallel mode | `8` |
+| `--m3u8-url` | Direct authorized m3u8 URL (bypasses episode extraction) | None |
+| `--name` | Output file name in direct m3u8 mode | `video` |
 
 ### Examples
 
@@ -71,6 +89,18 @@ Download a range (batch mode):
 
 ```bash
 python main.py "https://9animetv.to/watch/vinland-saga-40" --range 1-12
+```
+
+Download with parallel segments:
+
+```bash
+python main.py "https://9animetv.to/watch/vinland-saga-40?ep=1144" --type dub --parallel-segments --workers 12
+```
+
+Download from a direct authorized HLS link:
+
+```bash
+python main.py --m3u8-url "https://example.com/path/master.m3u8" --name "episode-01" --parallel-segments --workers 12
 ```
 
 Save to custom folder:
@@ -110,6 +140,9 @@ Invalid filename characters are stripped automatically.
 
 - `All servers failed`
 	9anime server links and APIs can change. Retry later or update extraction logic.
+
+- `Encrypted HLS playlist detected; use non-parallel ffmpeg mode`
+	The playlist uses encryption metadata; rerun without `--parallel-segments`.
 
 - HTTP or parsing errors
 	Temporary site/API changes or network restrictions may be the cause.
