@@ -3,12 +3,12 @@ import subprocess
 import argparse
 import os
 import re
-import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
+from tqdm import tqdm
 
 
 BASE = "https://9animetv.to"
@@ -27,8 +27,45 @@ def extract_episode_id(url):
     return url.split("ep=")[-1]
 
 
+def extract_season_id(url):
+    return url.split("/")[-1].split("-")[-1]
+
+
 def extract_title_slug(url):
     return url.split("/watch/")[1].split("?")[0]
+
+
+# -----------------------------
+# Step 0: Get All Episodes
+# -----------------------------
+def get_all_episodes(watch_url):
+    season_id = extract_season_id(watch_url)
+    res = requests.get(f"{BASE}/ajax/episode/list/{season_id}", headers=HEADERS)
+    res.raise_for_status()
+    soup = BeautifulSoup(res.json()["html"], "html.parser")
+    html_list = soup.find("div", class_="episodes-ul")
+    if not html_list:
+        return []
+
+    episodes_list = [
+        {
+            "id": episode.attrs.get("data-id"),
+            "episode": episode.attrs.get("data-number"),
+            "title": episode.attrs.get("title"),
+            "link": f"{BASE}{episode.attrs.get('href')}",
+        }
+        for episode in html_list.find_all("a")
+    ]
+
+    def _episode_sort_key(item):
+        raw_value = (item.get("episode") or "").strip()
+        try:
+            return (0, float(raw_value))
+        except ValueError:
+            return (1, raw_value)
+
+    episodes_list.sort(key=_episode_sort_key)
+    return episodes_list
 
 
 # -----------------------------
@@ -99,72 +136,6 @@ def parse_m3u8_duration(m3u8_url):
     return total if found and total > 0 else None
 
 
-def format_seconds(seconds):
-    seconds = max(0, int(seconds))
-    minutes, remaining_seconds = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-
-    if hours:
-        return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
-
-    return f"{minutes:02d}:{remaining_seconds:02d}"
-
-
-def render_progress(filename, current_seconds, total_seconds, speed=None):
-    width = 28
-
-    if total_seconds:
-        ratio = min(max(current_seconds / total_seconds, 0.0), 1.0)
-        filled = int(width * ratio)
-        bar = "#" * filled + "-" * (width - filled)
-        percent = f"{ratio * 100:6.2f}%"
-        elapsed = format_seconds(current_seconds)
-        total = format_seconds(total_seconds)
-        speed_text = f" | {speed}" if speed else ""
-        message = f"\r[{bar}] {percent} {elapsed}/{total}{speed_text} {filename}"
-    else:
-        spinner = "|/-\\"
-        frame = int(current_seconds) % len(spinner)
-        speed_text = f" | {speed}" if speed else ""
-        message = f"\r[{spinner[frame]}] {format_seconds(current_seconds)}{speed_text} {filename}"
-
-    sys.stdout.write(message[:120])
-    sys.stdout.flush()
-
-
-def clear_progress_line():
-    sys.stdout.write("\r" + " " * 140 + "\r")
-    sys.stdout.flush()
-
-
-def render_segment_progress(
-    filename,
-    completed,
-    total,
-    downloaded_bytes,
-    start_time,
-    done_seconds,
-    total_seconds,
-):
-    width = 28
-    ratio = completed / total if total else 0
-    filled = int(width * min(max(ratio, 0.0), 1.0))
-    bar = "#" * filled + "-" * (width - filled)
-    percent = f"{ratio * 100:6.2f}%"
-
-    elapsed = max(time.time() - start_time, 0.001)
-    mbps = (downloaded_bytes / 1024 / 1024) / elapsed
-
-    if total_seconds:
-        time_part = f"{format_seconds(done_seconds)}/{format_seconds(total_seconds)}"
-    else:
-        time_part = f"{completed}/{total} seg"
-
-    message = f"\r[{bar}] {percent} {time_part} | {mbps:.2f} MB/s {filename}"
-    sys.stdout.write(message[:140])
-    sys.stdout.flush()
-
-
 def get_media_playlist(m3u8_url, headers=None):
     headers = headers or {"User-Agent": "Mozilla/5.0"}
     res = requests.get(m3u8_url, headers=headers, timeout=30)
@@ -187,7 +158,9 @@ def get_media_playlist(m3u8_url, headers=None):
         return get_media_playlist(chosen, headers=headers)
 
     if any("#EXT-X-KEY:" in line and "METHOD=NONE" not in line for line in lines):
-        raise ValueError("Encrypted HLS playlist detected; use non-parallel ffmpeg mode")
+        raise ValueError(
+            "Encrypted HLS playlist detected; use non-parallel ffmpeg mode"
+        )
 
     segments = []
     durations = []
@@ -250,33 +223,42 @@ def parallel_download_hls(m3u8, output, headers=None, workers=8):
 
     completed = 0
     downloaded_bytes = 0
-    done_seconds = 0.0
-    start_time = time.time()
 
     with tempfile.TemporaryDirectory(prefix="hls_parts_") as tmp_dir:
-        part_paths = [os.path.join(tmp_dir, f"{idx:06d}.ts") for idx in range(total_segments)]
+        part_paths = [
+            os.path.join(tmp_dir, f"{idx:06d}.ts") for idx in range(total_segments)
+        ]
 
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-            futures = {
-                executor.submit(download_segment, url, part_paths[idx], headers): idx
-                for idx, url in enumerate(segments)
-            }
+        progress = tqdm(
+            total=total_segments,
+            desc=os.path.basename(output),
+            unit="seg",
+            dynamic_ncols=True,
+            leave=False,
+            mininterval=0.2,
+        )
 
-            for future in as_completed(futures):
-                idx = futures[future]
-                size = future.result()
-                completed += 1
-                downloaded_bytes += size
-                done_seconds += durations[idx] if idx < len(durations) else 0.0
-                render_segment_progress(
-                    os.path.basename(output),
-                    completed,
-                    total_segments,
-                    downloaded_bytes,
-                    start_time,
-                    done_seconds,
-                    total_seconds,
-                )
+        try:
+            with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+                futures = {
+                    executor.submit(download_segment, url, part_paths[idx], headers): idx
+                    for idx, url in enumerate(segments)
+                }
+
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    size = future.result()
+                    completed += 1
+                    downloaded_bytes += size
+                    progress.update(1)
+
+                    if total_seconds:
+                        progress.set_postfix(
+                            downloaded=f"{completed}/{total_segments}",
+                            size=f"{downloaded_bytes / 1024 / 1024:.1f} MB",
+                        )
+        finally:
+            progress.close()
 
         merged_path = os.path.join(tmp_dir, "merged.ts")
         with open(merged_path, "wb") as merged:
@@ -284,7 +266,6 @@ def parallel_download_hls(m3u8, output, headers=None, workers=8):
                 with open(part_path, "rb") as part_file:
                     merged.write(part_file.read())
 
-        clear_progress_line()
         remux_to_mp4(merged_path, output)
 
 
@@ -356,6 +337,17 @@ def download(m3u8, output, use_parallel=False, workers=8, headers=None):
 
     current_seconds = 0.0
     speed = None
+    last_reported_seconds = 0.0
+
+    progress = tqdm(
+        total=total_seconds,
+        desc=os.path.basename(output),
+        unit="s",
+        dynamic_ncols=True,
+        leave=False,
+        mininterval=0.2,
+        smoothing=0.1,
+    )
 
     try:
         if process.stdout is None:
@@ -369,24 +361,28 @@ def download(m3u8, output, use_parallel=False, workers=8, headers=None):
                 hours, minutes, rest = value.split(":")
                 seconds = float(rest)
                 current_seconds = int(hours) * 3600 + int(minutes) * 60 + seconds
-                render_progress(
-                    os.path.basename(output), current_seconds, total_seconds, speed
-                )
+                delta = max(0.0, current_seconds - last_reported_seconds)
+                if delta:
+                    progress.update(delta)
+                    last_reported_seconds = current_seconds
+                if speed:
+                    progress.set_postfix(speed=speed)
             elif line.startswith("speed="):
                 speed = line.split("=", 1)[1].strip()
+                progress.set_postfix(speed=speed)
             elif line == "progress=end":
                 if total_seconds:
-                    render_progress(
-                        os.path.basename(output), total_seconds, total_seconds, speed
-                    )
+                    progress.total = total_seconds
+                    progress.n = total_seconds
+                    progress.refresh()
 
         returncode = process.wait()
-        clear_progress_line()
 
         if returncode != 0:
             raise subprocess.CalledProcessError(returncode, cmd)
 
     finally:
+        progress.close()
         if process.stdout is not None:
             process.stdout.close()
 
@@ -394,8 +390,16 @@ def download(m3u8, output, use_parallel=False, workers=8, headers=None):
 # -----------------------------
 # Core Episode Downloader
 # -----------------------------
-def download_episode(ep_url, typ, out_dir, use_parallel=False, workers=8):
+def download_episode(
+    ep_url,
+    typ,
+    out_dir,
+    use_parallel=False,
+    workers=8,
+    episode_number=None,
+):
     ep_id = extract_episode_id(ep_url)
+    display_episode = str(episode_number) if episode_number is not None else ep_id
     slug = extract_title_slug(ep_url)
 
     print(f"\n[*] Episode ID: {ep_id}")
@@ -418,7 +422,7 @@ def download_episode(ep_url, typ, out_dir, use_parallel=False, workers=8):
             embed_id = extract_embed_id(embed)
             hls = get_hls(embed_id)
             print(hls)
-            filename = sanitize(f"{slug} - EP {ep_id} [{typ}].mp4")
+            filename = sanitize(f"{slug} - EP {display_episode} [{typ}].mp4")
             filepath = os.path.join(out_dir, filename)
 
             print(f"[+] Downloading: {filename}")
@@ -427,7 +431,10 @@ def download_episode(ep_url, typ, out_dir, use_parallel=False, workers=8):
                 filepath,
                 use_parallel=use_parallel,
                 workers=workers,
-                headers={"Referer": "https://rapid-cloud.co/", "User-Agent": "Mozilla/5.0"},
+                headers={
+                    "Referer": "https://rapid-cloud.co/",
+                    "User-Agent": "Mozilla/5.0",
+                },
             )
 
             print(f"[✅] Downloaded: {filename}")
@@ -444,9 +451,35 @@ def download_episode(ep_url, typ, out_dir, use_parallel=False, workers=8):
 # Batch Mode
 # -----------------------------
 def download_range(base_url, start, end, typ, out_dir, use_parallel=False, workers=8):
-    for ep in range(start, end + 1):
-        url = f"{base_url}?ep={ep}"
-        download_episode(url, typ, out_dir, use_parallel=use_parallel, workers=workers)
+    episodes_list = get_all_episodes(base_url)
+
+    def _episode_to_float(value):
+        try:
+            return float((value or "").strip())
+        except ValueError:
+            return None
+
+    filtered_list = []
+    for episode in episodes_list:
+        episode_value = _episode_to_float(episode.get("episode"))
+        if episode_value is None:
+            continue
+        if start <= episode_value <= end:
+            filtered_list.append(episode)
+
+    if not filtered_list:
+        print(f"[-] No episodes found in range {start}-{end}")
+        return
+
+    for ep in filtered_list:
+        download_episode(
+            ep.get("link"),
+            typ,
+            out_dir,
+            use_parallel=use_parallel,
+            workers=workers,
+            episode_number=ep.get("episode"),
+        )
 
 
 # -----------------------------
@@ -462,14 +495,18 @@ def main():
     parser.add_argument("--parallel-segments", action="store_true")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--m3u8-url", help="Direct authorized HLS URL")
-    parser.add_argument("--name", default="video", help="Output filename for --m3u8-url")
+    parser.add_argument(
+        "--name", default="video", help="Output filename for --m3u8-url"
+    )
 
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
 
     if args.m3u8_url:
-        output_name = args.name if args.name.lower().endswith(".mp4") else f"{args.name}.mp4"
+        output_name = (
+            args.name if args.name.lower().endswith(".mp4") else f"{args.name}.mp4"
+        )
         output_path = os.path.join(args.out, sanitize(output_name))
         print(f"[+] Downloading direct m3u8 to: {output_path}")
         download(
@@ -486,7 +523,14 @@ def main():
         parser.error("url is required unless --m3u8-url is provided")
 
     if args.range:
-        start, end = map(int, args.range.split("-"))
+        range_match = re.fullmatch(r"\s*(\d+)\s*-\s*(\d+)\s*", args.range)
+        if not range_match:
+            parser.error("--range must be in the format start-end (e.g. 1-12)")
+
+        start, end = map(int, range_match.groups())
+        if start > end:
+            parser.error("--range start must be less than or equal to end")
+
         download_range(
             args.url,
             start,

@@ -7,6 +7,7 @@ It supports:
 - sub and dub streams
 - automatic server fallback
 - single episode and batch range downloads
+- `tqdm`-based progress bars
 - optional parallel HLS segment downloading (`--parallel-segments`)
 - direct authorized m3u8 downloads (`--m3u8-url`)
 
